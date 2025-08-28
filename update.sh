@@ -1,60 +1,88 @@
 #!/bin/bash
+set -euo pipefail
 
-# get latest version from github
-LATEST_VERSION=$(curl -s https://raw.githubusercontent.com/KingJP/teamspeak-egg/master/tsversion)
-echo "Latest TeamSpeak3 Version: $LATEST_VERSION"
+echo "=== TeamSpeak Update/Start Script ==="
 
-# get installed version from version_installed.txt
-INSTALLED_VERSION=$(cat version_installed.txt)
-echo "Installed TeamSpeak3 Version: $INSTALLED_VERSION"
+# --- Installed version
+INSTALLED_VERSION="$( [ -s version_installed.txt ] && cat version_installed.txt || echo "" )"
+echo "Installed TeamSpeak3 Version: ${INSTALLED_VERSION:-<none>}"
 
-# check if there is a static version set in pterodactyl panel
-. "version_static.txt"
-STATIC_VERSION=0
-if ! [ "$SERVER_VERSION" = "undefined" ] && ! [ "$SERVER_VERSION" = 0 ];
-then
-    STATIC_VERSION=1
-    echo "Server is set to static version: $SERVER_VERSION"
+# --- Latest version (2 Mirrors)
+read_latest() {
+  for URL in \
+    "https://raw.githubusercontent.com/jpylypiw/teamspeak-egg/master/tsversion" \
+    "https://raw.githubusercontent.com/KingJP/teamspeak-egg/master/tsversion"
+  do
+    if LATEST_VERSION="$(curl -fsSL "$URL" 2>/dev/null | tr -d '\r' | head -n1)"; then
+      [ -n "$LATEST_VERSION" ] && { echo "$LATEST_VERSION"; return 0; }
+    fi
+  done
+  return 1
+}
+LATEST_VERSION="$(read_latest || true)"
+echo "Latest TeamSpeak3 Version: ${LATEST_VERSION:-<unknown>}"
+
+# --- Static version from version_static.txt
+STATIC_VERSION=""
+if [ -f version_static.txt ]; then
+  if grep -q '=' version_static.txt; then
+    # shellcheck disable=SC1091
+    . ./version_static.txt || true
+    STATIC_VERSION="${SERVER_VERSION:-}"
+  else
+    STATIC_VERSION="$(tr -d '\r' < version_static.txt)"
+  fi
+fi
+if [ -n "${STATIC_VERSION:-}" ] && [ "${STATIC_VERSION}" != "undefined" ] && [ "${STATIC_VERSION}" != "0" ]; then
+  echo "Server is set to static version: $STATIC_VERSION"
+  TARGET_VERSION="$STATIC_VERSION"
+else
+  TARGET_VERSION="$LATEST_VERSION"
 fi
 
-updateToVersion() {
-    TSVERSION=$1
-    echo "cleaning up files before the update..."
-    rm -r doc
-    rm -r redist
-    rm -r serverquerydocs
-    rm -r sql
-    rm -r tsdns
-    rm -r CHANGELOG
-    rm ./*.so
-    rm ./LICENSE*
-    rm ts3server
-    echo "downloading teamspeak version $TSVERSION and extracting file..."
-    curl https://files.teamspeak-services.com/releases/server/"$TSVERSION"/teamspeak3-server_linux_alpine-"$TSVERSION".tar.bz2 | tar xj --strip-components=1
-    echo 'download and extraction finished'
-    chmod +x ts3server_minimal_runscript.sh
-    echo 'permissions set.'
-    echo '' > .ts3server_license_accepted
-    echo 'accepted license'
-    echo "$TSVERSION" > version_installed.txt
-    echo 'version written into version_installed.txt file'
+# --- Download + extract
+download_and_extract() {
+  local v="$1"
+  echo "Cleaning up old files..."
+  rm -rf doc redist serverquerydocs sql tsdns CHANGELOG LICENSE* *.so ts3server || true
+
+  echo "Downloading TeamSpeak $v..."
+  local URL_AMD64="https://files.teamspeak-services.com/releases/server/${v}/teamspeak3-server_linux_amd64-${v}.tar.bz2"
+  local URL_ALPINE="https://files.teamspeak-services.com/releases/server/${v}/teamspeak3-server_linux_alpine-${v}.tar.bz2"
+
+  if curl -fsI "$URL_AMD64" >/dev/null 2>&1; then
+    curl -fsSL "$URL_AMD64" | tar xj --strip-components=1
+  elif curl -fsI "$URL_ALPINE" >/dev/null 2>&1; then
+    curl -fsSL "$URL_ALPINE" | tar xj --strip-components=1
+  else
+    echo "ERROR: Could not download TeamSpeak version $v" >&2
+    exit 1
+  fi
+
+  echo "Setting permissions..."
+  chmod +x ts3server_minimal_runscript.sh ts3server_startscript.sh || true
+  [ -f ts3server ] && chmod +x ts3server || true
+
+  : > .ts3server_license_accepted
+  echo "$v" > version_installed.txt
+  echo "Updated version_installed.txt = $v"
 }
 
-if [ "$LATEST_VERSION" != "$INSTALLED_VERSION" ] && [ "$STATIC_VERSION" = 0 ];
-then
-    updateToVersion "$LATEST_VERSION"
-elif [ "$SERVER_VERSION" != "$INSTALLED_VERSION" ] && [ "$STATIC_VERSION" = 1 ];
-then
-    updateToVersion "$SERVER_VERSION"
+# --- Check update
+if [ ! -f ts3server ] || [ -z "${INSTALLED_VERSION}" ] || [ "$TARGET_VERSION" != "$INSTALLED_VERSION" ]; then
+  download_and_extract "$TARGET_VERSION"
 else
-    echo 'No update required.'
+  echo "No update required."
 fi
 
-if [ ! -f ts3server.ini ]; then
-    ./ts3server_startscript.sh start createinifile=1
-    PID=$(pgrep ts3server)
-    kill "$PID"
+# --- Create ini if missing
+if [ ! -f ts3server.ini ] || [ ! -s ts3server.ini ]; then
+  echo "Creating ts3server.ini..."
+  ./ts3server_startscript.sh start createinifile=1 || true
+  sleep 2
+  pgrep ts3server >/dev/null 2>&1 && kill "$(pgrep ts3server)" || true
 fi
 
-echo 'starting server...'
-./ts3server_minimal_runscript.sh inifile=ts3server.ini
+mkdir -p logs || true
+echo "Starting server..."
+exec ./ts3server_minimal_runscript.sh inifile=ts3server.ini
